@@ -1,0 +1,110 @@
+Bootstrap: docker
+# Pinned base image. `latest` changes over time, and newer Debian releases have
+# dropped packages installed below (libgl1-mesa-glx).
+From: continuumio/miniconda3:24.7.1-0
+
+# Build from this directory, with the Phenix installer copied or linked here
+# (Phenix cannot be downloaded automatically or redistributed):
+#   cd container
+#   ln -s /path/to/Phenix-2.0-5936-Linux-x86_64.sh .
+#   apptainer build qfit_pipeline.sif qfit.def
+# To change versions, edit QFIT_REF / PHENIX_* in %post and the installer
+# name in %files.
+
+%files
+    Phenix-2.0-5936-Linux-x86_64.sh /opt/phenix-installer.sh
+
+%environment
+    export PHENIX=/opt/phenix-2.0-5936
+    export PATH=$PHENIX/phenix_bin:$PATH
+
+    # qFit's conda environment
+    . /opt/conda/etc/profile.d/conda.sh
+    conda activate qfit
+
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+%post
+    set -eu
+
+    # qFit: fork with the final-refinement fixes, at a fixed commit (never a branch).
+    QFIT_REPO=https://github.com/ericguan04/qfit-3.0.git
+    QFIT_REF=f9edb8635d56faf40c02b246f6ba48689801c7b6   # dev: occupancy groups, R-free flags, cull loop
+    PHENIX_VERSION=2.0-5936
+    PHENIX_PREFIX=/opt/phenix-${PHENIX_VERSION}
+
+    # 1. System packages
+    apt-get update
+    apt-get install -y \
+        git \
+        build-essential \
+        libgl1-mesa-glx \
+        libglu1-mesa \
+        libxrender1 \
+        libxcursor1 \
+        libxcomposite1 \
+        libxtst6 \
+        libfontconfig1 \
+        libxft2
+
+    # 2. Phenix (batch mode, fixed prefix)
+    bash /opt/phenix-installer.sh -b -p "${PHENIX_PREFIX}"
+    rm /opt/phenix-installer.sh
+
+    # 3. qFit. A full clone, so the version string records the commit.
+    git clone "${QFIT_REPO}" /opt/qfit-3.0
+    cd /opt/qfit-3.0
+    git checkout --detach "${QFIT_REF}"
+    git rev-parse HEAD > /opt/qfit-3.0.commit
+
+    # Pin what environment.yml leaves open to the versions that passed the
+    # tests: an unpinned cvxpy pulls in a release that needs numpy 2, which
+    # qFit excludes (numpy<2), and every qFit tool then fails on import.
+    # The edited copy goes to /tmp so the clone stays clean.
+    sed -e 's/^  - cvxpy$/  - cvxpy=1.6.7/' \
+        -e 's/^  - python>=3.9$/  - python=3.12/' \
+        environment.yml > /tmp/qfit_environment.yml
+    grep -q '^  - cvxpy=1.6.7$' /tmp/qfit_environment.yml
+    grep -q '^  - python=3.12$' /tmp/qfit_environment.yml
+    /opt/conda/bin/conda env create -f /tmp/qfit_environment.yml
+    /opt/conda/bin/conda run -n qfit pip install .
+    /opt/conda/bin/conda run -n qfit python -c "import numpy, cvxpy; assert numpy.__version__.startswith('1.'), numpy.__version__; assert cvxpy.__version__ == '1.6.7', cvxpy.__version__"
+
+    # Record versions as image labels (`apptainer inspect --labels`).
+    LABELS="${APPTAINER_LABELS:-${SINGULARITY_LABELS:-/dev/null}}"
+    echo "qfit.repo ${QFIT_REPO}" >> "${LABELS}"
+    echo "qfit.commit $(cat /opt/qfit-3.0.commit)" >> "${LABELS}"
+    echo "qfit.version $(/opt/conda/bin/conda run -n qfit python -m pip show qfit | awk '/^Version:/ {print $2}')" >> "${LABELS}"
+    echo "phenix.version ${PHENIX_VERSION}" >> "${LABELS}"
+    echo "build.date $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${LABELS}"
+
+    # 4. Cleanup
+    rm -f /tmp/qfit_environment.yml
+    /opt/conda/bin/conda clean -afy
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%test
+    # Runs at the end of the build (and with `apptainer test`): fail now rather
+    # than in the middle of a batch.
+    set -eu
+    . /opt/conda/etc/profile.d/conda.sh
+    conda activate qfit
+    export PHENIX=/opt/phenix-2.0-5936
+    export PATH=$PHENIX/phenix_bin:$PATH
+    python -c "import qfit, qfit.solvers"
+    for c in qfit_protein qfit_final_refine_xray.sh create_restraints_file.py \
+             redistribute_cull_low_occupancies remove_duplicates \
+             phenix.refine phenix.mtz.dump phenix.ready_set phenix.composite_omit_map \
+             phenix.fetch_pdb phenix.elbow phenix.pdbtools phenix.python; do
+        command -v "$c" > /dev/null || { echo "missing: $c"; exit 1; }
+    done
+    echo "qfit $(python -m pip show qfit | awk '/^Version:/ {print $2}') at $(cat /opt/qfit-3.0.commit)"
+
+%runscript
+    exec "$@"
+
+%help
+    Phenix 2.0 and qFit (fork with final-refinement fixes) for qfit_pipeline.
+    Versions: apptainer inspect --labels <image>.sif

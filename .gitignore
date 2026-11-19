@@ -1,0 +1,11 @@
+# Container images and the Phenix installer (licensed; never commit)
+*.sif
+container/Phenix-*.sh
+
+# Run output, if someone points a run directory inside the repo
+runs/
+
+.DS_Store
+
+# Python bytecode
+__pycache__/
